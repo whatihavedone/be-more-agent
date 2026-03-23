@@ -153,7 +153,7 @@ class BotGUI:
         self.master = master
         self.text_mode = text_mode
         master.title("Pi Assistant")
-        master.attributes('-fullscreen', True) 
+        master.attributes('-fullscreen', not text_mode) 
         master.bind('<Escape>', self.exit_fullscreen)
         
         # Inputs
