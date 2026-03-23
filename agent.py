@@ -28,7 +28,8 @@ import atexit
 import datetime
 import warnings
 import wave
-import struct 
+import struct
+import argparse 
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
@@ -143,8 +144,9 @@ class BotGUI:
     BG_WIDTH, BG_HEIGHT = 800, 480 
     OVERLAY_WIDTH, OVERLAY_HEIGHT = 400, 300 
 
-    def __init__(self, master):
+    def __init__(self, master, text_mode=False):
         self.master = master
+        self.text_mode = text_mode
         master.title("Pi Assistant")
         master.attributes('-fullscreen', True) 
         master.bind('<Escape>', self.exit_fullscreen)
@@ -448,37 +450,61 @@ class BotGUI:
             self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
             self.tts_thread.start()
             
-            while True:
-                trigger_source = self.detect_wake_word_or_ptt()
-                if self.interrupted.is_set():
-                    self.interrupted.clear()
-                    self.set_state(BotStates.IDLE, "Resetting...")
-                    continue
-
-                self.set_state(BotStates.LISTENING, "I'm listening!")
-                
-                audio_file = None
-                if trigger_source == "PTT":
-                    audio_file = self.record_voice_ptt()
-                else:
-                    audio_file = self.record_voice_adaptive()
-                
-                if not audio_file: 
-                    self.set_state(BotStates.IDLE, "Heard nothing.")
-                    continue
-                
-                user_text = self.transcribe_audio(audio_file)
-                if not user_text:
-                    self.set_state(BotStates.IDLE, "Transcription empty.")
-                    continue
-                
-                self.append_to_text(f"YOU: {user_text}")
-                self.interrupted.clear()
-                self.chat_and_respond(user_text, img_path=None)
+            if self.text_mode:
+                self._run_text_mode()
+            else:
+                self._run_voice_mode()
                     
         except Exception as e:
             traceback.print_exc()
             self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
+
+    def _run_text_mode(self):
+        print("\n[TEXT MODE] Type your messages below. Press Ctrl+C to exit.\n", flush=True)
+        self.set_state(BotStates.IDLE, "Text mode active")
+        while True:
+            try:
+                user_text = input("You: ").strip()
+                if not user_text:
+                    continue
+                self.append_to_text(f"YOU: {user_text}")
+                self.interrupted.clear()
+                self.chat_and_respond(user_text, img_path=None)
+                self.set_state(BotStates.IDLE, "Ready")
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                print("\n[TEXT MODE] Exiting...", flush=True)
+                break
+
+    def _run_voice_mode(self):
+        while True:
+            trigger_source = self.detect_wake_word_or_ptt()
+            if self.interrupted.is_set():
+                self.interrupted.clear()
+                self.set_state(BotStates.IDLE, "Resetting...")
+                continue
+
+            self.set_state(BotStates.LISTENING, "I'm listening!")
+            
+            audio_file = None
+            if trigger_source == "PTT":
+                audio_file = self.record_voice_ptt()
+            else:
+                audio_file = self.record_voice_adaptive()
+            
+            if not audio_file: 
+                self.set_state(BotStates.IDLE, "Heard nothing.")
+                continue
+            
+            user_text = self.transcribe_audio(audio_file)
+            if not user_text:
+                self.set_state(BotStates.IDLE, "Transcription empty.")
+                continue
+            
+            self.append_to_text(f"YOU: {user_text}")
+            self.interrupted.clear()
+            self.chat_and_respond(user_text, img_path=None)
 
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
@@ -917,7 +943,11 @@ class BotGUI:
             json.dump([full[0]] + conv, f, indent=4)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Be More Agent")
+    parser.add_argument('--text-mode', action='store_true', help="Run in text-only mode (bypass voice)")
+    args = parser.parse_args()
+    
     print("--- SYSTEM STARTING ---", flush=True)
     root = tk.Tk()
-    app = BotGUI(root)
+    app = BotGUI(root, text_mode=args.text_mode)
     root.mainloop()
