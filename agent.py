@@ -45,7 +45,9 @@ from openwakeword.model import Model
 import ollama 
 
 # --- WEB SEARCH (Using your working import) ---
-from ddgs import DDGS 
+from ddgs import DDGS
+import urllib.request
+import urllib.parse 
 
 # =========================================================================
 # 1. CONFIGURATION & CONSTANTS
@@ -124,6 +126,9 @@ You: {"action": "search_web", "value": "robots news"}
 
 User: What do you see right now?
 You: {"action": "capture_image", "value": "environment"}
+
+User: What's the weather in Tokyo?
+You: {"action": "get_weather", "value": "Tokyo"}
 
 ### END EXAMPLES ###
 """
@@ -376,13 +381,13 @@ class BotGUI:
         value = action_data.get("value") or action_data.get("query")
         
         VALID_TOOLS = {
-            "get_time", "search_web", "capture_image"
+            "get_time", "search_web", "capture_image", "get_weather"
         }
         
         ALIASES = {
             "google": "search_web", "browser": "search_web", "news": "search_web",         
             "search_news": "search_web", "look": "capture_image", "see": "capture_image", 
-            "check_time": "get_time"
+            "check_time": "get_time", "weather": "get_weather", "forecast": "get_weather"
         }
 
         action = ALIASES.get(raw_action, raw_action)
@@ -436,8 +441,65 @@ class BotGUI:
         
         elif action == "capture_image":
              return "IMAGE_CAPTURE_TRIGGERED"
+        
+        elif action == "get_weather":
+            return self._fetch_weather(value)
 
         return None
+    
+    def _fetch_weather(self, location):
+        if not location:
+            location = "Berlin"
+        print(f"[WEATHER] Fetching weather for: {location}", flush=True)
+        try:
+            geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(location)}&count=1"
+            with urllib.request.urlopen(geo_url, timeout=10) as resp:
+                geo_data = json.loads(resp.read().decode())
+            
+            if not geo_data.get("results"):
+                return f"Could not find location: {location}"
+            
+            place = geo_data["results"][0]
+            lat, lon = place["latitude"], place["longitude"]
+            name = place.get("name", location)
+            country = place.get("country", "")
+            
+            weather_url = (
+                f"https://api.open-meteo.com/v1/forecast?"
+                f"latitude={lat}&longitude={lon}"
+                f"&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
+                f"&temperature_unit=celsius"
+            )
+            with urllib.request.urlopen(weather_url, timeout=10) as resp:
+                weather_data = json.loads(resp.read().decode())
+            
+            current = weather_data.get("current", {})
+            temp = current.get("temperature_2m", "?")
+            humidity = current.get("relative_humidity_2m", "?")
+            wind = current.get("wind_speed_10m", "?")
+            code = current.get("weather_code", 0)
+            
+            condition = self._weather_code_to_text(code)
+            
+            return (
+                f"Weather in {name}, {country}: {condition}. "
+                f"Temperature: {temp}°C, Humidity: {humidity}%, Wind: {wind} km/h."
+            )
+        except Exception as e:
+            print(f"[WEATHER] Error: {e}", flush=True)
+            return f"Could not fetch weather for {location}."
+    
+    def _weather_code_to_text(self, code):
+        codes = {
+            0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+            45: "Foggy", 48: "Depositing rime fog",
+            51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+            61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+            71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+            80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+            95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail"
+        }
+        return codes.get(code, "Unknown conditions")
 
     # =========================================================================
     # 4. CORE LOGIC
