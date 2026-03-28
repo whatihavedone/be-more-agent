@@ -42,7 +42,7 @@ import scipy.signal
 # --- AI ENGINES ---
 import openwakeword
 from openwakeword.model import Model
-import ollama 
+import requests
 
 # --- WEB SEARCH (Using your working import) ---
 from ddgs import DDGS
@@ -68,7 +68,8 @@ DEFAULT_CONFIG = {
     "voice_model": "piper/en_GB-semaine-medium.onnx",
     "chat_memory": True,
     "camera_rotation": 0,
-    "system_prompt_extras": ""
+    "system_prompt_extras": "",
+    "ollama_host": "http://localhost:11434"
 }
 
 # LLM SETTINGS
@@ -94,6 +95,7 @@ def load_config():
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = CURRENT_CONFIG["text_model"]
 VISION_MODEL = CURRENT_CONFIG["vision_model"]
+OLLAMA_HOST = CURRENT_CONFIG.get("ollama_host", "http://localhost:11434")
 
 class BotStates:
     IDLE = "idle"             
@@ -103,6 +105,66 @@ class BotStates:
     ERROR = "error"           
     CAPTURING = "capturing" 
     WARMUP = "warmup"       
+
+# =========================================================================
+# OLLAMA API HELPER FUNCTIONS
+# =========================================================================
+
+def ollama_generate(model, prompt, keep_alive=-1, stream=False, options=None):
+    """Generate text using Ollama API via be-more-brain"""
+    url = f"{OLLAMA_HOST}/api/generate"
+    
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": stream,
+        "keep_alive": keep_alive
+    }
+    
+    if options:
+        payload["options"] = options
+    
+    try:
+        response = requests.post(url, json=payload, timeout=300)
+        response.raise_for_status()
+        
+        if stream:
+            return response.iter_lines()
+        else:
+            return response.json()
+    except Exception as e:
+        print(f"[OLLAMA API ERROR] Generate failed: {e}", flush=True)
+        raise
+
+def ollama_chat(model, messages, stream=False, options=None):
+    """Chat with Ollama API via be-more-brain"""
+    url = f"{OLLAMA_HOST}/api/chat"
+    
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": stream
+    }
+    
+    if options:
+        payload["options"] = options
+    
+    try:
+        response = requests.post(url, json=payload, timeout=300)
+        response.raise_for_status()
+        
+        if stream:
+            # Return an iterator that yields message chunks
+            def chunk_generator():
+                for line in response.iter_lines():
+                    if line:
+                        yield json.loads(line)
+            return chunk_generator()
+        else:
+            return response.json()
+    except Exception as e:
+        print(f"[OLLAMA API ERROR] Chat failed: {e}", flush=True)
+        raise
 
 # --- SYSTEM PROMPT ---
 BASE_SYSTEM_PROMPT = """You are a helpful robot assistant running on a Raspberry Pi.
@@ -247,7 +309,7 @@ class BotGUI:
         self.save_chat_history()
         
         try:
-            ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=0)
+            ollama_generate(TEXT_MODEL, "", keep_alive=0)
         except: pass
 
         self.master.quit()
@@ -571,7 +633,7 @@ class BotGUI:
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
         try:
-            ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
+            ollama_generate(TEXT_MODEL, "", keep_alive=-1)
         except Exception as e:
             print(f"Failed to load {TEXT_MODEL}: {e}", flush=True)
         self.play_sound(self.get_random_sound(greeting_sounds_dir))
@@ -765,7 +827,7 @@ class BotGUI:
         sentence_buffer = "" 
         
         try:
-            stream = ollama.chat(model=model_to_use, messages=messages, stream=True, options=OLLAMA_OPTIONS)
+            stream = ollama_chat(model_to_use, messages, stream=True, options=OLLAMA_OPTIONS)
             
             is_action_mode = False
             
@@ -851,7 +913,7 @@ class BotGUI:
                         self.set_state(BotStates.THINKING, "Reading...")
                         self.thinking_sound_active.set()
                         
-                        final_resp = ollama.chat(model=model_to_use, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
+                        final_resp = ollama_chat(model_to_use, summary_prompt, stream=False, options=OLLAMA_OPTIONS)
                         final_text = final_resp['message']['content']
                         
                         self.thinking_sound_active.clear()
