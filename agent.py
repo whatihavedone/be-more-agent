@@ -15,6 +15,7 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import json
 import os
@@ -48,6 +49,8 @@ import requests
 from ddgs import DDGS
 import urllib.request
 import urllib.parse 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # =========================================================================
 # 1. CONFIGURATION & CONSTANTS
@@ -97,6 +100,23 @@ TEXT_MODEL = CURRENT_CONFIG["text_model"]
 VISION_MODEL = CURRENT_CONFIG["vision_model"]
 OLLAMA_HOST = CURRENT_CONFIG.get("ollama_host", "http://localhost:11434")
 
+# --- CONNECTION POOLING FOR PERFORMANCE ---
+def create_session():
+    """Create a requests session with connection pooling and retries"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=2,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+OLLAMA_SESSION = create_session()
+
 class BotStates:
     IDLE = "idle"             
     LISTENING = "listening"   
@@ -125,7 +145,7 @@ def ollama_generate(model, prompt, keep_alive=-1, stream=False, options=None):
         payload["options"] = options
     
     try:
-        response = requests.post(url, json=payload, timeout=300)
+        response = OLLAMA_SESSION.post(url, json=payload, timeout=30)
         response.raise_for_status()
         
         if stream:
@@ -150,7 +170,7 @@ def ollama_chat(model, messages, stream=False, options=None):
         payload["options"] = options
     
     try:
-        response = requests.post(url, json=payload, timeout=300)
+        response = OLLAMA_SESSION.post(url, json=payload, timeout=30)
         response.raise_for_status()
         
         if stream:
@@ -234,6 +254,12 @@ class BotGUI:
         self.session_memory = []
         self.thinking_sound_active = threading.Event()
         
+        # Thread pool for background tasks
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
+        
+        # Batch GUI updates
+        self.gui_update_buffer = []
+        
         self.last_ptt_time = 0 
         self.ptt_event = threading.Event()       
         self.recording_active = threading.Event() 
@@ -282,7 +308,7 @@ class BotGUI:
         self.load_animations()
         self.update_animation() 
         
-        threading.Thread(target=self.safe_main_execution, daemon=True).start()
+        self.thread_pool.submit(self.safe_main_execution)
 
     # --- HELPERS ---
 
@@ -304,7 +330,10 @@ class BotGUI:
 
         self.recording_active.clear()
         self.thinking_sound_active.clear()
-        self.tts_active.clear() 
+        self.tts_active.clear()
+        
+        # Shutdown thread pool
+        self.thread_pool.shutdown(wait=False)
         
         self.save_chat_history()
         
@@ -427,9 +456,20 @@ class BotGUI:
         self.master.after(0, _update)
 
     def _stream_to_text(self, chunk):
+        """Buffer chunks and batch update GUI every 5 characters"""
+        self.gui_update_buffer.append(chunk)
+        if len(''.join(self.gui_update_buffer)) >= 5 or '\n' in chunk:
+            self._flush_text_buffer()
+    
+    def _flush_text_buffer(self):
+        """Flush accumulated text to GUI in one batch"""
+        if not self.gui_update_buffer:
+            return
+        text = ''.join(self.gui_update_buffer)
+        self.gui_update_buffer.clear()
         def update_text_stream():
             self.response_text.config(state=tk.NORMAL)
-            self.response_text.insert(tk.END, chunk)
+            self.response_text.insert(tk.END, text)
             self.response_text.see(tk.END) 
             self.response_text.config(state=tk.DISABLED)
         self.master.after(0, update_text_stream)
@@ -571,8 +611,7 @@ class BotGUI:
         try:
             self.warm_up_logic()
             self.tts_active.set()
-            self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
-            self.tts_thread.start()
+            self.tts_thread = self.thread_pool.submit(self._tts_worker)
             
             if self.text_mode:
                 self._run_text_mode()
@@ -821,7 +860,7 @@ class BotGUI:
             messages = self.permanent_memory + self.session_memory + [user_msg]
         
         self.thinking_sound_active.set()
-        threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
+        self.thread_pool.submit(self._run_thinking_sound_loop)
         
         full_response_buffer = ""
         sentence_buffer = "" 
@@ -856,6 +895,9 @@ class BotGUI:
                     if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
                         with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
                     sentence_buffer = ""
+            
+            # Flush any remaining buffered text
+            self._flush_text_buffer()
 
             if is_action_mode:
                 action_data = self.extract_json_from_text(full_response_buffer)
@@ -904,7 +946,7 @@ class BotGUI:
                         self.append_to_text(fallback_text, newline=True)
                         with self.tts_queue_lock: self.tts_queue.append(fallback_text)
 
-                    elif tool_result:
+                    elif tool_result:   
                         summary_prompt = [
                             {"role": "system", "content": "Summarize this result in one short sentence."},
                             {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
