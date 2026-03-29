@@ -46,7 +46,7 @@ from openwakeword.model import Model
 import requests
 
 # --- WEB SEARCH (Using your working import) ---
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 import urllib.request
 import urllib.parse 
 from requests.adapters import HTTPAdapter
@@ -72,6 +72,8 @@ DEFAULT_CONFIG = {
     "chat_memory": True,
     "camera_rotation": 0,
     "system_prompt_extras": "",
+    "input_device": None,
+    "input_sample_rate": None,
     "ollama_host": "http://localhost:11434"
 }
 
@@ -99,6 +101,72 @@ CURRENT_CONFIG = load_config()
 TEXT_MODEL = CURRENT_CONFIG["text_model"]
 VISION_MODEL = CURRENT_CONFIG["vision_model"]
 OLLAMA_HOST = CURRENT_CONFIG.get("ollama_host", "http://localhost:11434")
+
+
+def resolve_input_device(config):
+    requested = config.get("input_device")
+    if requested in (None, "", "default"):
+        return None
+
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        print(f"[AUDIO] Device query failed: {e}", flush=True)
+        return None
+
+    if isinstance(requested, int) or (isinstance(requested, str) and str(requested).isdigit()):
+        index = int(requested)
+        if 0 <= index < len(devices):
+            return index
+        print(f"[AUDIO] Input device index not found: {index}", flush=True)
+        return None
+
+    requested_lower = str(requested).lower()
+    for idx, dev in enumerate(devices):
+        print(f"[AUDIO DEBUG] Index {idx}: {dev.get('name')} (In: {dev.get('max_input_channels')})", flush=True)
+        if dev.get("max_input_channels", 0) > 0 and requested_lower in dev.get("name", "").lower():
+            return idx
+
+    print(f"[AUDIO] Input device name not found: {requested}", flush=True)
+    return None
+
+
+def choose_input_samplerate(device, preferred=None):
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+
+    try:
+        device_info = sd.query_devices(device)
+        print(f"[AUDIO DEBUG] Device Info: {device_info}", flush=True)
+        if "default_samplerate" in device_info:
+            candidates.append(int(device_info["default_samplerate"]))
+    except Exception as e:
+        print(f"[AUDIO DEBUG] Query failed: {e}", flush=True)
+
+    candidates.extend([48000, 44100, 32000, 16000])
+    seen = set()
+    for rate in candidates:
+        if not rate or rate in seen:
+            continue
+        seen.add(rate)
+        try:
+            sd.check_input_settings(device=device, samplerate=rate, channels=1, dtype="int16")
+            return rate
+        except Exception:
+            continue
+
+    return int(candidates[0]) if candidates else 44100
+
+
+INPUT_DEVICE_NAME = resolve_input_device(CURRENT_CONFIG)
+if INPUT_DEVICE_NAME is not None:
+    try:
+        device_info = sd.query_devices(INPUT_DEVICE_NAME)
+        print(f"[AUDIO] Using input device: {device_info.get('name', INPUT_DEVICE_NAME)}", flush=True)
+    except Exception:
+        print(f"[AUDIO] Using input device index: {INPUT_DEVICE_NAME}", flush=True)
+
 
 # --- CONNECTION POOLING FOR PERFORMANCE ---
 def create_session():
@@ -270,6 +338,7 @@ class BotGUI:
         self.tts_thread = None       
         self.tts_active = threading.Event()
         self.current_audio_process = None 
+        self.exiting = False
         
         # --- WAKE WORD INITIALIZATION ---
         print("[INIT] Loading Wake Word...", flush=True)
@@ -321,6 +390,10 @@ class BotGUI:
         except: return None
 
     def safe_exit(self):
+        if self.exiting:
+            return
+        self.exiting = True
+
         print("\n--- SHUTDOWN SEQUENCE ---", flush=True)
         if self.current_audio_process:
             try:
@@ -341,8 +414,14 @@ class BotGUI:
             ollama_generate(TEXT_MODEL, "", keep_alive=0)
         except: pass
 
-        self.master.quit()
-        sys.exit(0) 
+        try:
+            sd.stop()
+        except: pass
+
+        try:
+            self.master.quit()
+        except Exception:
+            pass
         
     def exit_fullscreen(self, event=None):
         self.master.attributes('-fullscreen', False)
@@ -681,8 +760,9 @@ class BotGUI:
     def detect_wake_word_or_ptt(self):
         self.set_state(BotStates.IDLE, "Waiting...")
         self.ptt_event.clear()
-        
-        if self.oww_model: self.oww_model.reset()
+
+        if self.oww_model:
+            self.oww_model.reset()
 
         if self.oww_model is None:
             self.ptt_event.wait()
@@ -691,52 +771,101 @@ class BotGUI:
 
         CHUNK_SIZE = 1280
         OWW_SAMPLE_RATE = 16000
-        
-        try:
-            device_info = sd.query_devices(kind='input')
-            native_rate = int(device_info['default_samplerate'])
-        except: native_rate = 48000
-            
-        use_resampling = (native_rate != OWW_SAMPLE_RATE)
-        input_rate = native_rate if use_resampling else OWW_SAMPLE_RATE
+
+        input_rate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
+        use_resampling = (input_rate != OWW_SAMPLE_RATE)
         input_chunk_size = int(CHUNK_SIZE * (input_rate / OWW_SAMPLE_RATE)) if use_resampling else CHUNK_SIZE
 
+        stream_args = {
+            "samplerate": input_rate,
+            "channels": 1,
+            "dtype": "int16",
+            "blocksize": input_chunk_size,
+            "device": INPUT_DEVICE_NAME
+        }
+
         try:
-            with sd.InputStream(samplerate=input_rate, channels=1, dtype='int16', 
-                                blocksize=input_chunk_size, device=INPUT_DEVICE_NAME) as stream:
-                while True:
-                    if self.ptt_event.is_set():
-                        self.ptt_event.clear()
-                        return "PTT"
-                    
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
-                    if rlist: 
-                        sys.stdin.readline()
-                        return "CLI" 
+            self._listen_loop(stream_args, input_chunk_size, CHUNK_SIZE, use_resampling)
+        except StopIteration as si:
+            return str(si)
+        except Exception as e:
+            print(f"[AUDIO] Stream failed with defaults: {e}. Retrying with loose settings...", flush=True)
+            try:
+                stream_args["blocksize"] = 0
+                stream_args["latency"] = "high"
+                stream_args["blocksize"] = 1024
+                use_resampling = True
+                self._listen_loop(stream_args, 1024, CHUNK_SIZE, use_resampling)
+            except StopIteration as si:
+                return str(si)
+            except Exception as e2:
+                print(f"[CRITICAL] Wake Word Stream Error: {e2}", flush=True)
+                self.ptt_event.wait()
+                return "PTT"
 
-                    data, _ = stream.read(input_chunk_size)
-                    audio_data = np.frombuffer(data, dtype=np.int16)
+        return "WAKE"
 
-                    if use_resampling:
-                         audio_data = scipy.signal.resample(audio_data, CHUNK_SIZE).astype(np.int16)
+    def _listen_loop(self, stream_args, input_chunk_size, target_chunk_size, use_resampling):
+        # Force software backend (no mmap) via environment variable if possible,
+        # but here we can try to hint loop settings.
+        # However, the most effective fix for ALSA mmap issues is often just asking for 'blocksize=0'
+        # and letting portaudio manage the buffering, OR very small chunks.
 
+        with sd.InputStream(**stream_args) as stream:
+            print(f"[AUDIO] Listening with rate {stream_args['samplerate']} and block {stream_args['blocksize']}", flush=True)
+
+            while True:
+                if self.ptt_event.is_set():
+                    self.ptt_event.clear()
+                    raise StopIteration("PTT")
+
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
+                if rlist:
+                    sys.stdin.readline()
+                    raise StopIteration("CLI")
+
+                read_size = input_chunk_size
+                if stream_args.get('blocksize') == 0:
+                    read_size = 1024
+
+                try:
+                    data, overflow = stream.read(read_size)
+                    if overflow:
+                        print("!", end="", flush=True)
+                        if overflow > 10:
+                            raise RuntimeError("Audio Buffer Overflow - Triggering Safe Mode")
+                except Exception as e:
+                    raise RuntimeError(f"Audio read failed: {e}")
+
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.flatten()
+
+                if use_resampling:
+                    step = len(audio_data) / target_chunk_size
+                    indices = np.arange(0, len(audio_data), step)[:target_chunk_size].astype(int)
+                    audio_data = audio_data[indices]
+
+                current_max = np.max(np.abs(audio_data))
+
+                if current_max > 200:
                     prediction = self.oww_model.predict(audio_data)
                     for mdl in self.oww_model.prediction_buffer.keys():
-                        if list(self.oww_model.prediction_buffer[mdl])[-1] > WAKE_WORD_THRESHOLD:
-                            self.oww_model.reset() 
-                            return "WAKE"
-        except Exception as e:
-            print(f"Wake Word Stream Error: {e}")
-            self.ptt_event.wait()
-            return "PTT"
+                        score = list(self.oww_model.prediction_buffer[mdl])[-1]
+                        if score > 0.1:
+                            print(f"\n[WAKE] Triggered on '{mdl}' with score: {score:.2f}", flush=True)
+                            self.oww_model.reset()
+                            return
 
     def record_voice_adaptive(self, filename="input.wav"):
         print("Recording (Adaptive)...", flush=True)
-        time.sleep(0.5) 
+        time.sleep(0.5)
+        samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
+
         try:
-            device_info = sd.query_devices(kind='input')
-            samplerate = int(device_info['default_samplerate'])
-        except: samplerate = 44100 
+            sd.stop()
+            time.sleep(0.2)
+        except: pass
 
         silence_threshold = 0.006
         silence_duration = 1.5
@@ -774,18 +903,24 @@ class BotGUI:
     def record_voice_ptt(self, filename="input.wav"):
         print("Recording (PTT)...", flush=True)
         time.sleep(0.5)
+        samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
+
         try:
-            device_info = sd.query_devices(kind='input')
-            samplerate = int(device_info['default_samplerate'])
-        except: samplerate = 44100 
+            sd.stop()
+            time.sleep(0.2)
+        except: pass
 
         buffer = []
-        def callback(indata, frames, time_info, status): buffer.append(indata.copy())
+        def callback(indata, frames, time_info, status):
+            buffer.append(indata.copy())
         
         try:
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE_NAME):
-                while self.recording_active.is_set(): sd.sleep(50)
-        except Exception as e: return None
+                while self.recording_active.is_set():
+                    sd.sleep(50)
+        except Exception as e:
+            print(f"[AUDIO ERROR] PTT Recording Failed: {e}", flush=True)
+            return None
             
         return self.save_audio_buffer(buffer, filename, samplerate)
 
